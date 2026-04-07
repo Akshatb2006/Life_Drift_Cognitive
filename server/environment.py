@@ -2,7 +2,9 @@
 
 import random
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+
+from openenv.core.env_server.interfaces import Environment
 
 from models import LifeDriftAction, LifeDriftObservation, LifeDriftState
 
@@ -96,29 +98,26 @@ USER_RESPONSES = {
 TIME_PERIODS = ["morning", "late_morning", "afternoon", "late_afternoon", "evening"]
 
 
-class LifeDriftEnvironment:
+class LifeDriftEnvironment(Environment[LifeDriftAction, LifeDriftObservation, LifeDriftState]):
     """Simulates a user's productivity and cognitive state."""
 
     SUPPORTS_CONCURRENT_SESSIONS = True
 
     def __init__(self):
-        self._sessions: Dict[str, Dict[str, Any]] = {}
-
-    def _get_session(self, episode_id: str) -> Dict[str, Any]:
-        if episode_id not in self._sessions:
-            raise ValueError(f"No active session: {episode_id}")
-        return self._sessions[episode_id]
+        super().__init__()
+        self._session: Optional[Dict[str, Any]] = None
 
     def reset(
         self,
-        task_id: str = "drift_correction",
         seed: Optional[int] = None,
         episode_id: Optional[str] = None,
+        **kwargs: Any,
     ) -> LifeDriftObservation:
         """Reset environment to initial state for a given task."""
         if seed is not None:
             random.seed(seed)
 
+        task_id = kwargs.get("task_id", "drift_correction")
         if task_id not in TASKS:
             raise ValueError(f"Unknown task: {task_id}. Available: {list(TASKS.keys())}")
 
@@ -126,7 +125,7 @@ class LifeDriftEnvironment:
         init = task["initial_state"]
         eid = episode_id or str(uuid.uuid4())
 
-        session = {
+        self._session = {
             "episode_id": eid,
             "task_id": task_id,
             "step_count": 0,
@@ -147,18 +146,22 @@ class LifeDriftEnvironment:
             "reward_history": [],
             "done": False,
         }
-        self._sessions[eid] = session
 
-        return self._make_observation(session, reward=0.0, done=False)
+        return self._make_observation(reward=0.0, done=False)
 
     def step(
-        self, episode_id: str, action: LifeDriftAction
+        self,
+        action: LifeDriftAction,
+        timeout_s: Optional[float] = None,
+        **kwargs: Any,
     ) -> LifeDriftObservation:
         """Execute one step in the environment."""
-        session = self._get_session(episode_id)
+        session = self._session
+        if session is None:
+            raise ValueError("Environment not reset. Call reset() first.")
 
         if session["done"]:
-            return self._make_observation(session, reward=0.0, done=True)
+            return self._make_observation(reward=0.0, done=True)
 
         # Save previous state for reward computation
         prev_alignment = session["goal_alignment_score"]
@@ -166,7 +169,7 @@ class LifeDriftEnvironment:
         prev_fatigue = session["fatigue"]
 
         # Apply action effects
-        self._apply_action(session, action)
+        self._apply_action(action)
 
         # Advance time
         session["step_count"] += 1
@@ -176,10 +179,10 @@ class LifeDriftEnvironment:
         )
 
         # Add natural drift/fatigue accumulation
-        self._apply_natural_dynamics(session)
+        self._apply_natural_dynamics()
 
         # Clamp all values
-        self._clamp_values(session)
+        self._clamp_values()
 
         # Record history
         session["alignment_history"].append(session["goal_alignment_score"])
@@ -188,21 +191,22 @@ class LifeDriftEnvironment:
         session["energy_history"].append(session["energy_level"])
 
         # Compute reward
-        reward = self._compute_reward(
-            session, prev_alignment, prev_drift, prev_fatigue
-        )
+        reward = self._compute_reward(prev_alignment, prev_drift, prev_fatigue)
         session["reward_history"].append(reward)
 
         # Check episode end
         done = session["step_count"] >= session["max_steps"]
         session["done"] = done
 
-        return self._make_observation(session, reward=reward, done=done)
+        return self._make_observation(reward=reward, done=done)
 
-    def state(self, episode_id: str) -> LifeDriftState:
+    @property
+    def state(self) -> LifeDriftState:
         """Return current state metadata."""
-        session = self._get_session(episode_id)
-        score = self._grade(session)
+        if self._session is None:
+            return LifeDriftState()
+        session = self._session
+        score = self._grade()
         return LifeDriftState(
             episode_id=session["episode_id"],
             step_count=session["step_count"],
@@ -210,26 +214,26 @@ class LifeDriftEnvironment:
             score=score,
         )
 
-    def grade(self, episode_id: str) -> float:
+    def grade(self) -> float:
         """Compute final grader score for the episode."""
-        session = self._get_session(episode_id)
-        return self._grade(session)
+        return self._grade()
 
-    def _grade(self, session: Dict[str, Any]) -> float:
+    def _grade(self) -> float:
         """Internal grading logic per task."""
+        session = self._session
+        if session is None:
+            return 0.0
+
         task_id = session["task_id"]
 
         if task_id == "drift_correction":
-            # Success: alignment > 0.7, drift < 0.3
             final_align = session["goal_alignment_score"]
             final_drift = session["drift_score"]
-            # Score based on how close to success criteria
             align_score = min(final_align / 0.7, 1.0)
             drift_score = min((1.0 - final_drift) / 0.7, 1.0)
             return round(0.6 * align_score + 0.4 * drift_score, 4)
 
         elif task_id == "energy_balance":
-            # Success: alignment stays > 0.6, fatigue < 0.5
             avg_align = sum(session["alignment_history"]) / len(session["alignment_history"])
             final_fatigue = session["fatigue"]
             avg_fatigue = sum(session["fatigue_history"]) / len(session["fatigue_history"])
@@ -242,7 +246,6 @@ class LifeDriftEnvironment:
             )
 
         elif task_id == "long_term_stability":
-            # Success: low avg drift, stable energy, no burnout spikes
             avg_drift = sum(session["drift_history"]) / len(session["drift_history"])
             avg_energy = sum(session["energy_history"]) / len(session["energy_history"])
             max_fatigue = max(session["fatigue_history"])
@@ -251,7 +254,6 @@ class LifeDriftEnvironment:
                 if session["reward_history"]
                 else 0
             )
-            # Energy stability: penalize variance
             energy_var = sum(
                 (e - avg_energy) ** 2 for e in session["energy_history"]
             ) / len(session["energy_history"])
@@ -271,23 +273,20 @@ class LifeDriftEnvironment:
 
         return 0.0
 
-    def _apply_action(self, session: Dict[str, Any], action: LifeDriftAction):
+    def _apply_action(self, action: LifeDriftAction):
         """Apply the agent's action to the environment state."""
+        session = self._session
         action_type = action.action_type
         target = action.target_goal or (session["goals"][0] if session["goals"] else "general")
 
-        # Validate target goal
         if target not in session["goals"]:
             target = session["goals"][0] if session["goals"] else "general"
 
-        # Generate simulated user response
         templates = USER_RESPONSES.get(action_type, USER_RESPONSES["do_nothing"])
         response = random.choice(templates).format(goal=target)
         session["recent_actions"] = session["recent_actions"][-2:] + [response]
 
-        # Apply effects based on action type
         if action_type == "suggest_task":
-            # User works on a goal - alignment up, energy down, drift down
             effectiveness = random.uniform(0.08, 0.18)
             session["goal_alignment_score"] += effectiveness
             session["drift_score"] -= effectiveness * 0.9
@@ -296,7 +295,6 @@ class LifeDriftEnvironment:
             session["focus_score"] += random.uniform(0.02, 0.08)
 
         elif action_type == "insert_break":
-            # User rests - energy up, fatigue down, slight drift up
             recovery = random.uniform(0.1, 0.2)
             session["energy_level"] += recovery
             session["fatigue"] -= recovery * 1.1
@@ -305,21 +303,18 @@ class LifeDriftEnvironment:
             session["goal_alignment_score"] -= random.uniform(0.01, 0.04)
 
         elif action_type == "reschedule_task":
-            # Reorganize - moderate alignment boost, slight energy cost
             session["goal_alignment_score"] += random.uniform(0.05, 0.1)
             session["drift_score"] -= random.uniform(0.04, 0.08)
             session["energy_level"] -= random.uniform(0.02, 0.05)
             session["focus_score"] += random.uniform(0.03, 0.07)
 
         elif action_type == "reduce_difficulty":
-            # Easier tasks - less fatigue gain, moderate alignment
             session["fatigue"] -= random.uniform(0.03, 0.07)
             session["energy_level"] += random.uniform(0.02, 0.05)
             session["goal_alignment_score"] += random.uniform(0.03, 0.08)
             session["drift_score"] -= random.uniform(0.02, 0.05)
 
         elif action_type == "prioritize_goal":
-            # Strong focus on one goal - big alignment boost but energy cost
             session["goal_alignment_score"] += random.uniform(0.1, 0.2)
             session["drift_score"] -= random.uniform(0.08, 0.15)
             session["energy_level"] -= random.uniform(0.08, 0.15)
@@ -327,38 +322,34 @@ class LifeDriftEnvironment:
             session["focus_score"] += random.uniform(0.05, 0.1)
 
         elif action_type == "do_nothing":
-            # No intervention - drift increases, energy slowly recovers
             session["drift_score"] += random.uniform(0.05, 0.1)
             session["goal_alignment_score"] -= random.uniform(0.03, 0.07)
             session["energy_level"] += random.uniform(0.01, 0.03)
             session["fatigue"] -= random.uniform(0.01, 0.03)
             session["focus_score"] -= random.uniform(0.03, 0.06)
 
-    def _apply_natural_dynamics(self, session: Dict[str, Any]):
+    def _apply_natural_dynamics(self):
         """Apply natural time-based dynamics."""
-        # Natural fatigue accumulation over time
+        session = self._session
         session["fatigue"] += random.uniform(0.01, 0.03)
-        # Natural drift accumulation (entropy)
         session["drift_score"] += random.uniform(0.01, 0.02)
-        # Energy naturally decreases
         session["energy_level"] -= random.uniform(0.01, 0.03)
 
-        # Time-of-day effects
         time_period = TIME_PERIODS[session["time_index"]]
         if time_period == "morning":
-            session["focus_score"] += 0.02  # Morning focus bonus
+            session["focus_score"] += 0.02
         elif time_period in ("late_afternoon", "evening"):
-            session["fatigue"] += 0.02  # End-of-day fatigue
+            session["fatigue"] += 0.02
             session["focus_score"] -= 0.02
 
-        # Burnout cascade: if fatigue is very high, everything degrades
         if session["fatigue"] > 0.85:
             session["focus_score"] -= 0.05
             session["goal_alignment_score"] -= 0.03
             session["drift_score"] += 0.03
 
-    def _clamp_values(self, session: Dict[str, Any]):
+    def _clamp_values(self):
         """Clamp all values to [0, 1]."""
+        session = self._session
         for key in [
             "goal_alignment_score",
             "energy_level",
@@ -370,40 +361,33 @@ class LifeDriftEnvironment:
 
     def _compute_reward(
         self,
-        session: Dict[str, Any],
         prev_alignment: float,
         prev_drift: float,
         prev_fatigue: float,
     ) -> float:
         """Compute step reward with dense signal."""
+        session = self._session
         alignment_delta = session["goal_alignment_score"] - prev_alignment
         drift_delta = session["drift_score"] - prev_drift
         fatigue_delta = session["fatigue"] - prev_fatigue
 
-        # Reward alignment improvement
         r_alignment = 0.4 * alignment_delta
-
-        # Reward drift reduction (negative drift_delta is good)
         r_drift = -0.3 * drift_delta
 
-        # Energy balance: reward being in the sweet spot (0.4-0.7)
         energy = session["energy_level"]
         if 0.4 <= energy <= 0.7:
             r_energy = 0.1
         else:
             r_energy = -0.05
 
-        # Penalize fatigue increase
         r_fatigue = -0.2 * max(0, fatigue_delta)
 
-        # Bonus for being in good state
         state_bonus = 0.0
         if session["goal_alignment_score"] > 0.7 and session["drift_score"] < 0.3:
             state_bonus = 0.1
         if session["fatigue"] < 0.4 and session["energy_level"] > 0.5:
             state_bonus += 0.05
 
-        # Penalty for critical states
         if session["fatigue"] > 0.9:
             state_bonus -= 0.15
         if session["drift_score"] > 0.8:
@@ -412,17 +396,21 @@ class LifeDriftEnvironment:
         reward = r_alignment + r_drift + r_energy + r_fatigue + state_bonus
         return round(max(-1.0, min(1.0, reward)), 4)
 
-    def _make_observation(
-        self, session: Dict[str, Any], reward: float, done: bool
-    ) -> LifeDriftObservation:
+    def _make_observation(self, reward: float, done: bool) -> LifeDriftObservation:
         """Create observation from session state."""
+        session = self._session
         task = TASKS[session["task_id"]]
         time_period = TIME_PERIODS[session["time_index"]]
+
+        # Include grade in metadata when episode is done
+        meta = {"episode_id": session["episode_id"]}
+        if done:
+            meta["score"] = self._grade()
 
         return LifeDriftObservation(
             done=done,
             reward=reward,
-            metadata={"episode_id": session["episode_id"]},
+            metadata=meta,
             goals=session["goals"],
             recent_actions=session["recent_actions"],
             goal_alignment_score=round(session["goal_alignment_score"], 4),
@@ -436,7 +424,3 @@ class LifeDriftEnvironment:
             task_id=session["task_id"],
             task_description=task["description"],
         )
-
-    def cleanup_session(self, episode_id: str):
-        """Remove a completed session."""
-        self._sessions.pop(episode_id, None)

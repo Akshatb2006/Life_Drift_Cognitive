@@ -1,25 +1,28 @@
-"""Inference script for the Life Drift & Cognitive Load environment.
-
+"""
+Inference Script for Life Drift & Cognitive Load Environment
+===================================
 Uses an OpenAI-compatible LLM to act as a productivity coaching agent.
 """
 
+import asyncio
 import json
 import os
-import sys
 import textwrap
 from typing import List, Optional
 
-import requests
 from openai import OpenAI
 
-# --- Configuration (mandatory env vars) ---
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY", "")
-ENV_URL = os.getenv("ENV_URL", "http://localhost:8000")
+from client import LifeDriftEnv
+from models import LifeDriftAction
 
-BENCHMARK = "life_drift_cognitive_env"
-TASKS = ["drift_correction", "energy_balance", "long_term_stability"]
+IMAGE_NAME = os.getenv("IMAGE_NAME")
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+TASK_NAME = os.getenv("LIFE_DRIFT_TASK", "drift_correction")
+BENCHMARK = os.getenv("LIFE_DRIFT_BENCHMARK", "life_drift_cognitive_env")
+MAX_STEPS = 20
 TEMPERATURE = 0.3
 MAX_TOKENS = 150
 
@@ -33,7 +36,9 @@ VALID_ACTIONS = [
 ]
 
 SYSTEM_PROMPT = textwrap.dedent("""\
-You are a productivity coaching AI agent. You observe a user's cognitive state and take actions to optimize their goal alignment while managing energy and preventing burnout.
+You are a productivity coaching AI agent. You observe a user's cognitive state \
+and take actions to optimize their goal alignment while managing energy and \
+preventing burnout.
 
 Available actions (respond with JSON only):
 - suggest_task: Suggest the user work on a specific goal. Requires target_goal.
@@ -54,8 +59,6 @@ Respond with ONLY a JSON object:
 {"action_type": "<action>", "target_goal": "<goal_or_null>"}
 """)
 
-
-# --- Mandatory stdout logging ---
 
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
@@ -78,26 +81,23 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     )
 
 
-# --- Helpers ---
-
-def format_observation(obs: dict) -> str:
+def format_observation(obs) -> str:
     return textwrap.dedent(f"""\
-Current State (Step {obs['step_number']}/{obs['max_steps']}):
-- Task: {obs['task_description']}
-- Goals: {', '.join(obs['goals'])}
-- Goal Alignment: {obs['goal_alignment_score']:.2f}
-- Drift Score: {obs['drift_score']:.2f}
-- Energy Level: {obs['energy_level']:.2f}
-- Fatigue: {obs['fatigue']:.2f}
-- Focus Score: {obs['focus_score']:.2f}
-- Time of Day: {obs['time_of_day']}
-- Recent Actions: {', '.join(obs['recent_actions'])}
-- Reward: {obs.get('reward', 0):.4f}
+Current State (Step {obs.step_number}/{obs.max_steps}):
+- Task: {obs.task_description}
+- Goals: {', '.join(obs.goals)}
+- Goal Alignment: {obs.goal_alignment_score:.2f}
+- Drift Score: {obs.drift_score:.2f}
+- Energy Level: {obs.energy_level:.2f}
+- Fatigue: {obs.fatigue:.2f}
+- Focus Score: {obs.focus_score:.2f}
+- Time of Day: {obs.time_of_day}
+- Recent Actions: {', '.join(obs.recent_actions)}
 
 What action should be taken? Respond with JSON only.""")
 
 
-def parse_llm_response(response_text: str, goals: list) -> dict:
+def parse_llm_response(response_text: str, goals: list) -> LifeDriftAction:
     try:
         text = response_text.strip()
         if "```" in text:
@@ -106,145 +106,108 @@ def parse_llm_response(response_text: str, goals: list) -> dict:
                 text = text[4:]
             text = text.strip()
 
-        action = json.loads(text)
-        action_type = action.get("action_type", "do_nothing")
+        parsed = json.loads(text)
+        action_type = parsed.get("action_type", "do_nothing")
         if action_type not in VALID_ACTIONS:
             action_type = "do_nothing"
 
-        target_goal = action.get("target_goal")
+        target_goal = parsed.get("target_goal")
         if target_goal and target_goal not in goals:
             target_goal = goals[0] if goals else None
 
-        return {"action_type": action_type, "target_goal": target_goal}
+        return LifeDriftAction(action_type=action_type, target_goal=target_goal)
 
     except (json.JSONDecodeError, KeyError, IndexError):
         text_lower = response_text.lower()
         if "break" in text_lower:
-            return {"action_type": "insert_break", "target_goal": None}
+            return LifeDriftAction(action_type="insert_break", target_goal=None)
         elif "suggest" in text_lower or "task" in text_lower:
-            return {"action_type": "suggest_task", "target_goal": goals[0] if goals else None}
+            return LifeDriftAction(action_type="suggest_task", target_goal=goals[0] if goals else None)
         elif "prioritize" in text_lower:
-            return {"action_type": "prioritize_goal", "target_goal": goals[0] if goals else None}
+            return LifeDriftAction(action_type="prioritize_goal", target_goal=goals[0] if goals else None)
         elif "reschedule" in text_lower:
-            return {"action_type": "reschedule_task", "target_goal": None}
+            return LifeDriftAction(action_type="reschedule_task", target_goal=None)
         elif "reduce" in text_lower or "difficulty" in text_lower:
-            return {"action_type": "reduce_difficulty", "target_goal": None}
+            return LifeDriftAction(action_type="reduce_difficulty", target_goal=None)
         else:
-            return {"action_type": "do_nothing", "target_goal": None}
+            return LifeDriftAction(action_type="do_nothing", target_goal=None)
 
 
-def get_llm_action(client: OpenAI, obs: dict) -> dict:
-    user_msg = format_observation(obs)
+def get_model_action(client: OpenAI, obs, history: List[str]) -> LifeDriftAction:
+    user_prompt = format_observation(obs)
     try:
-        response = client.chat.completions.create(
+        completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
+                {"role": "user", "content": user_prompt},
             ],
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
+            stream=False,
         )
-        llm_text = response.choices[0].message.content or ""
-    except Exception as e:
-        print(f"[DEBUG] LLM error: {e}", flush=True)
-        llm_text = '{"action_type": "do_nothing"}'
+        text = (completion.choices[0].message.content or "").strip()
+        if not text:
+            text = '{"action_type": "do_nothing"}'
+    except Exception as exc:
+        print(f"[DEBUG] Model request failed: {exc}", flush=True)
+        text = '{"action_type": "do_nothing"}'
 
-    return parse_llm_response(llm_text, obs["goals"])
+    return parse_llm_response(text, obs.goals)
 
 
-def run_task(client: OpenAI, task_id: str, seed: int = 42) -> dict:
+async def main() -> None:
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
+    env = await LifeDriftEnv.from_docker_image(IMAGE_NAME)
+
+    history: List[str] = []
     rewards: List[float] = []
     steps_taken = 0
     score = 0.0
     success = False
 
-    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
+    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        # Reset environment
-        reset_resp = requests.post(
-            f"{ENV_URL}/reset",
-            json={"task_id": task_id, "seed": seed},
-            timeout=30,
-        )
-        reset_resp.raise_for_status()
-        obs = reset_resp.json()
-        episode_id = obs["metadata"]["episode_id"]
+        result = await env.reset(task_id=TASK_NAME)
+        obs = result.observation
 
-        while not obs["done"]:
-            action = get_llm_action(client, obs)
-            action_str = action["action_type"]
+        for step in range(1, MAX_STEPS + 1):
+            if result.done:
+                break
 
-            # Step environment
-            step_resp = requests.post(
-                f"{ENV_URL}/step",
-                json={"episode_id": episode_id, "action": action},
-                timeout=30,
-            )
-            step_resp.raise_for_status()
-            obs = step_resp.json()
+            action = get_model_action(client, obs, history)
 
-            reward = obs.get("reward", 0.0) or 0.0
-            done = obs.get("done", False)
-            error = obs.get("last_action_error")
-            steps_taken += 1
+            result = await env.step(action)
+            obs = result.observation
+
+            reward = result.reward or 0.0
+            done = result.done
+            error = None
+
             rewards.append(reward)
+            steps_taken = step
 
-            log_step(step=steps_taken, action=action_str, reward=reward, done=done, error=error)
+            log_step(step=step, action=action.action_type, reward=reward, done=done, error=error)
+
+            history.append(f"Step {step}: {action.action_type} -> reward {reward:+.2f}")
 
             if done:
                 break
 
-        # Get final grade
-        grade_resp = requests.post(
-            f"{ENV_URL}/grade",
-            json={"episode_id": episode_id},
-            timeout=30,
-        )
-        grade_resp.raise_for_status()
-        grade = grade_resp.json()
-        score = max(0.0, min(1.0, grade["score"]))
+        # Get score from metadata if available, otherwise compute from rewards
+        score = obs.metadata.get("score", 0.0) if obs.metadata else 0.0
+        score = min(max(score, 0.0), 1.0)
         success = score > 0.0
 
-        # Cleanup
-        try:
-            requests.post(f"{ENV_URL}/cleanup/{episode_id}", timeout=10)
-        except Exception:
-            pass
-
-    except Exception as e:
-        print(f"[DEBUG] Task {task_id} error: {e}", flush=True)
-
     finally:
+        try:
+            await env.close()
+        except Exception as e:
+            print(f"[DEBUG] env.close() error (container cleanup): {e}", flush=True)
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
-
-    return {"task_id": task_id, "score": score, "steps": steps_taken, "rewards": rewards}
-
-
-def main():
-    if not API_KEY:
-        print("ERROR: Set HF_TOKEN or API_KEY environment variable.", flush=True)
-        sys.exit(1)
-
-    # Verify environment is running
-    try:
-        health = requests.get(f"{ENV_URL}/health", timeout=10)
-        health.raise_for_status()
-    except Exception:
-        print(f"ERROR: Cannot connect to environment at {ENV_URL}", flush=True)
-        sys.exit(1)
-
-    client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
-
-    results = []
-    for task_id in TASKS:
-        result = run_task(client, task_id, seed=42)
-        results.append(result)
-
-    avg_score = sum(r["score"] for r in results) / len(results) if results else 0.0
-    print(f"\nAverage Score: {avg_score:.4f}", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
