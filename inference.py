@@ -149,8 +149,9 @@ def run_task(client: OpenAI, task_id: str, seed: int = 42) -> dict:
             llm_text = '{"action_type": "do_nothing"}'
 
         action = parse_llm_response(llm_text, obs["goals"])
-        print(f"  Step {step}: action={action['action_type']}"
-              f"{f' ({action[\"target_goal\"]})' if action['target_goal'] else ''}")
+        target = action['target_goal']
+        suffix = f" ({target})" if target else ""
+        print(f"  Step {step}: action={action['action_type']}{suffix}")
 
         # Step environment
         step_resp = requests.post(

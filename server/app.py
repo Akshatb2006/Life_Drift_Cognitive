@@ -52,8 +52,10 @@ def root():
 
 
 @app.post("/reset", response_model=LifeDriftObservation)
-def reset(request: ResetRequest):
+def reset(request: Optional[ResetRequest] = None):
     try:
+        if request is None:
+            request = ResetRequest()
         obs = env.reset(
             task_id=request.task_id,
             seed=request.seed,
