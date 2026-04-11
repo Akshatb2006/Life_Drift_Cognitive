@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import textwrap
+import time
 from typing import List, Optional
 
 from openai import OpenAI
@@ -134,26 +135,40 @@ def parse_llm_response(response_text: str, goals: list) -> LifeDriftAction:
 
 
 def get_model_action(client: OpenAI, obs, history: List[str]) -> LifeDriftAction:
+    """Call the LLM with retries. Raises on exhaustion so failures are visible."""
     user_prompt = format_observation(obs)
-    try:
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            stream=False,
-        )
-        text = (completion.choices[0].message.content or "").strip()
-        if not text:
-            text = '{"action_type": "do_nothing"}'
-    except Exception as exc:
-        print(f"[DEBUG] Model request failed: {exc}", flush=True)
-        text = '{"action_type": "do_nothing"}'
+    max_attempts = 3
+    last_exc: Optional[Exception] = None
 
-    return parse_llm_response(text, obs.goals)
+    for attempt in range(max_attempts):
+        try:
+            completion = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+                stream=False,
+            )
+            text = (completion.choices[0].message.content or "").strip()
+            if not text:
+                text = '{"action_type": "do_nothing"}'
+            return parse_llm_response(text, obs.goals)
+        except Exception as exc:
+            last_exc = exc
+            print(
+                f"[DEBUG] Model request attempt {attempt + 1}/{max_attempts} failed: {exc}",
+                flush=True,
+            )
+            if attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)  # 1s, 2s
+
+    # All retries exhausted — fail loudly. run_task() catches this and logs the task error.
+    raise RuntimeError(
+        f"LLM API failed after {max_attempts} attempts. Last error: {last_exc}"
+    )
 
 
 def clamp_score(score: float) -> float:

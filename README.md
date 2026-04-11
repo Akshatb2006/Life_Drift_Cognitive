@@ -9,145 +9,134 @@ tags:
   - openenv
 ---
 
-# Life Drift & Cognitive Load Environment
+# Life Drift — Cognitive Load Planning Benchmark
 
-An OpenEnv environment that simulates **productivity coaching** — an AI agent must guide a simulated user toward their goals while managing cognitive energy and preventing burnout.
+A sequential decision-making benchmark where an agent must guide a simulated user toward long-term goals under realistic cognitive constraints: limited energy, accumulating fatigue, stochastic behavioral drift, and a nonlinear burnout cascade.
 
-## Motivation
+## Benchmark Objective
 
-Everyone struggles with staying on track and avoiding burnout. This environment models the real tension between **pushing toward goals** and **managing energy** — a task that human coaches, therapists, and productivity systems handle daily. Training AI agents on this task has direct applications in:
+The environment evaluates three distinct planning skills under human-like dynamics:
 
-- AI-powered productivity apps
-- Digital wellness coaching
-- Adaptive task schedulers
-- Burnout prevention systems
+1. **Short-horizon correction** — recover alignment from a degraded state.
+2. **Trade-off balancing** — sustain productivity while containing fatigue.
+3. **Long-horizon planning under risk** — keep mixed metrics stable while avoiding an irreversible burnout region.
 
-## How It Works
+Formally, the agent solves a finite-horizon control problem over a 5-dimensional continuous cognitive state `(alignment, drift, energy, fatigue, focus) ∈ [0,1]⁵` acting on a discrete intervention set. Transitions are stochastic within per-action bounds and include a nonlinear cascade above `fatigue > 0.85` that makes late-episode recovery increasingly expensive — **rewarding foresight over reactive play**.
 
-The environment simulates a user with:
-- **Goals** they want to achieve (fitness, study, side projects)
-- **Energy** that depletes with work and recovers with rest
-- **Drift** that increases when they go off-track
-- **Fatigue** that accumulates and can cause burnout cascades
+## Why the Task Resists Greedy Play
 
-The agent acts as a life coach, making micro-interventions each step.
+Most productivity-style environments reduce to "push on the graded axis." Life Drift is designed to resist that:
+
+- **Every action trades off.** There is no free action. `insert_break` restores energy but drifts alignment. `prioritize_goal` boosts alignment but accelerates fatigue. `do_nothing` drifts and loses alignment. The agent must choose *which* axis to pay with.
+- **Fatigue has a soft cliff.** Above `fatigue = 0.85`, focus and alignment begin to degrade *on their own* and drift accelerates — a cascade that punishes agents who optimize short-term reward at the cost of recovery margin.
+- **Dynamics are stochastic.** Each action's magnitude is drawn from a bounded range, so policies that memorize a single trajectory fail to generalize across seeds.
+- **Time-of-day modulates cost.** Late afternoon and evening compound fatigue and reduce focus, so the same action has different expected value depending on when in the episode it fires.
+
+Together these make the environment a test of **planning under delayed, irreversible, and stochastic consequences** — not just reactive heuristics.
 
 ## Observation Space
 
+The full agent view is a `LifeDriftObservation` with these fields:
+
 | Field | Type | Range | Description |
-|-------|------|-------|-------------|
-| `goals` | `List[str]` | — | User's active goals |
-| `recent_actions` | `List[str]` | — | Last 3 simulated user actions |
-| `goal_alignment_score` | `float` | [0, 1] | How aligned actions are with goals |
-| `energy_level` | `float` | [0, 1] | Current energy/motivation |
-| `fatigue` | `float` | [0, 1] | Accumulated fatigue (burnout risk) |
-| `focus_score` | `float` | [0, 1] | Current concentration level |
-| `drift_score` | `float` | [0, 1] | How far user has drifted from goals |
-| `time_of_day` | `str` | — | Simulated time period |
-| `step_number` | `int` | — | Current step |
-| `max_steps` | `int` | — | Episode length |
+|---|---|---|---|
+| `goal_alignment_score` | float | [0, 1] | How aligned recent user actions are with stated goals |
+| `drift_score` | float | [0, 1] | Distance from goal-directed behavior |
+| `energy_level` | float | [0, 1] | Available cognitive energy |
+| `fatigue` | float | [0, 1] | Accumulated fatigue (cascade threshold at 0.85) |
+| `focus_score` | float | [0, 1] | Current concentration |
+| `goals` | List[str] | — | Active user goals (per task) |
+| `recent_actions` | List[str] | — | Last 3 simulated user behaviors |
+| `time_of_day` | str | — | Simulated diurnal phase |
+| `step_number`, `max_steps` | int | — | Episode progress |
 
 ## Action Space
 
-| Action | Description | Effect |
-|--------|-------------|--------|
-| `suggest_task` | Suggest working on a goal | Alignment ↑, Energy ↓, Drift ↓ |
-| `insert_break` | Suggest a rest break | Energy ↑, Fatigue ↓, Drift ↑ slightly |
-| `reschedule_task` | Reorganize schedule | Alignment ↑ moderate, Energy ↓ slight |
-| `reduce_difficulty` | Simplify current task | Fatigue ↓, Alignment ↑ slight |
-| `prioritize_goal` | Focus on one specific goal | Alignment ↑↑, Energy ↓↓ |
-| `do_nothing` | No intervention | Drift ↑, Natural recovery |
+| Action | Dominant effect | Cost |
+|---|---|---|
+| `suggest_task` | alignment ↑, drift ↓ | energy ↓, fatigue ↑ |
+| `prioritize_goal` | alignment ↑↑, drift ↓↓ | energy ↓↓, fatigue ↑ |
+| `insert_break` | energy ↑, fatigue ↓ | drift ↑, alignment ↓ slight |
+| `reschedule_task` | alignment ↑ moderate, drift ↓ | energy ↓ slight |
+| `reduce_difficulty` | fatigue ↓, alignment ↑ slight | minimal |
+| `do_nothing` | passive energy recovery | drift ↑, alignment ↓ |
 
-Actions that target specific goals accept `target_goal` parameter.
+All actions accept an optional `target_goal`. Effect magnitudes are drawn stochastically within per-action bounds.
 
-## Reward Function
+## Reward
 
-Dense reward signal computed each step:
+Dense shaped reward, clipped to `[-1, 1]`:
 
 ```
-reward = 0.4 * alignment_improvement
-       - 0.3 * drift_increase
-       + 0.1 * energy_balance_bonus
-       - 0.2 * fatigue_increase
-       + state_bonuses/penalties
+reward = 0.4 · Δalignment
+       − 0.3 · Δdrift
+       − 0.2 · max(0, Δfatigue)          # only penalize fatigue increases
+       + energy_window_bonus             # +0.1 if energy ∈ [0.4, 0.7] else -0.05
+       + state_shaping                   # +/- bonuses for healthy / critical states
 ```
 
-- **Bonuses**: High alignment + low drift (+0.1), good energy + low fatigue (+0.05)
-- **Penalties**: Critical fatigue > 0.9 (-0.15), high drift > 0.8 (-0.1)
-- Burnout cascade: fatigue > 0.85 causes focus, alignment, and drift to degrade
+The reward signal is intentionally dense and shaped to be trainable. **Grading is computed separately** (see below) so agents cannot fully game the reward proxy.
 
 ## Tasks
 
-### Task 1: Drift Correction (Easy)
-- **Scenario**: User is wasting time — low alignment (0.2), high drift (0.8)
-- **Goal**: Bring alignment > 0.7 and drift < 0.3 within 10 steps
-- **Grader**: `0.6 * (alignment/0.7) + 0.4 * ((1-drift)/0.7)`
+All tasks use fixed initial conditions and accept a `seed` parameter for reproducibility.
 
-### Task 2: Energy Balance (Medium)
-- **Scenario**: User is productive but exhausted — high alignment (0.8), high fatigue (0.8)
-- **Goal**: Maintain alignment > 0.6 while reducing fatigue < 0.5 over 15 steps
-- **Grader**: `0.4 * avg_alignment + 0.3 * (1-avg_fatigue) + 0.3 * (1-final_fatigue)`
+### Task 1 — Drift Correction *(10 steps, easy)*
+**Tests:** reactive short-term control.
+**Initial:** `alignment=0.2, drift=0.8, energy=0.7, fatigue=0.3`.
+**Grader:** `0.6 · min(alignment / 0.7, 1) + 0.4 · min((1 − drift) / 0.7, 1)`
 
-### Task 3: Long-term Stability (Hard)
-- **Scenario**: Mixed behavior — all metrics at 0.5, 4 goals to balance over 20 steps
-- **Goal**: Optimize both low drift AND stable energy with no burnout spikes
-- **Grader**: `0.3 * (1-avg_drift) + 0.25 * energy_stability + 0.25 * (1-max_fatigue) + 0.2 * avg_reward`
+### Task 2 — Energy Balance *(15 steps, medium)*
+**Tests:** sustained trade-off management between two competing axes.
+**Initial:** `alignment=0.8, fatigue=0.8, energy=0.3` — already productive, already burning out.
+**Grader:** `0.4 · avg_alignment + 0.3 · (1 − avg_fatigue) + 0.3 · (1 − final_fatigue)`
 
-## Setup
+### Task 3 — Long-term Stability *(20 steps, hard)*
+**Tests:** long-horizon planning under the burnout cascade with a 4-goal portfolio.
+**Initial:** all metrics at `0.5` (high-variance starting point).
+**Grader:** weighted combination of inverse average drift, energy-variance stability, worst-case fatigue, and mean step reward.
 
-### Local Development
+All graders clamp to the open interval `(0.01, 0.99)` so every run produces a meaningful bounded scalar.
 
-```bash
-pip install -r requirements.txt
-uvicorn server.app:app --host 0.0.0.0 --port 8000
-```
+## Running
 
 ### Docker
-
 ```bash
 docker build -t life-drift-env .
 docker run -p 8000:8000 life-drift-env
 ```
 
-### Run Baseline Inference
-
+### Local
 ```bash
-export OPENAI_API_KEY=your_key
-export API_BASE_URL=https://api.openai.com/v1
-export MODEL_NAME=gpt-4o-mini
-export ENV_URL=http://localhost:8000
+pip install -r requirements.txt
+uvicorn server.app:app --host 0.0.0.0 --port 8000
+```
 
+### Baseline LLM agent
+```bash
+export HF_TOKEN=your_key
+export API_BASE_URL=https://router.huggingface.co/v1
+export MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
 python inference.py
 ```
 
-## API Endpoints
+## API
 
 | Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/reset` | POST | Start new episode `{task_id, seed, episode_id}` |
-| `/step` | POST | Take action `{episode_id, action}` |
-| `/state/{episode_id}` | GET | Get current state metadata |
-| `/grade` | POST | Get grader score `{episode_id}` |
+|---|---|---|
+| `/reset` | POST | Start episode. Body: `{task_id, seed, episode_id}` |
+| `/step` | POST | Take action. Body: `{episode_id, action}` |
+| `/state/{episode_id}` | GET | Current state metadata (includes score) |
+| `/grade` | POST | Get final grader score. Body: `{episode_id}` |
 | `/tasks` | GET | List available tasks |
 | `/cleanup/{episode_id}` | POST | Clean up session |
-
-## Expected Baseline Scores
-
-With a simple rule-based heuristic strategy:
-- **drift_correction** (easy): ~0.75–0.85
-- **energy_balance** (medium): ~0.55–0.70
-- **long_term_stability** (hard): ~0.45–0.60
-
-With an LLM agent (gpt-4o-mini):
-- Scores typically 5-15% higher than rule-based baseline
+| `/health` | GET | Health check |
 
 ## Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `API_BASE_URL` | LLM API endpoint | `https://api.openai.com/v1` |
-| `MODEL_NAME` | Model identifier | `gpt-4o-mini` |
-| `HF_TOKEN` | HuggingFace / API key | — |
-| `OPENAI_API_KEY` | OpenAI API key (or HF_TOKEN) | — |
-| `ENV_URL` | Environment server URL | `http://localhost:8000` |
+| Var | Default |
+|---|---|
+| `API_BASE_URL` | `https://router.huggingface.co/v1` |
+| `MODEL_NAME` | `Qwen/Qwen2.5-72B-Instruct` |
+| `HF_TOKEN` / `API_KEY` | — |
+| `IMAGE_NAME` | — (Docker image tag for containerized runs) |

@@ -230,9 +230,14 @@ class LifeDriftEnvironment(Environment[LifeDriftAction, LifeDriftObservation, Li
         if task_id == "drift_correction":
             final_align = session["goal_alignment_score"]
             final_drift = session["drift_score"]
-            align_score = min(final_align / 0.7, 1.0)
-            drift_score = min((1.0 - final_drift) / 0.7, 1.0)
-            return round(0.6 * align_score + 0.4 * drift_score, 4)
+            # Strict multiplicative hurdle: BOTH alignment and drift must clear
+            # real thresholds. Neither term alone can carry the score.
+            # Thresholds tuned to what a well-played 10-step episode can reach:
+            #   align_hurdle: 0 at align <= 0.3, 1 at align >= 0.75
+            #   drift_hurdle: 0 at drift >= 0.6, 1 at drift <= 0.2
+            align_hurdle = max(0.0, min(1.0, (final_align - 0.3) / 0.45))
+            drift_hurdle = max(0.0, min(1.0, (0.6 - final_drift) / 0.4))
+            return round(align_hurdle * drift_hurdle, 4)
 
         elif task_id == "energy_balance":
             avg_align = sum(session["alignment_history"]) / len(session["alignment_history"])
@@ -250,11 +255,6 @@ class LifeDriftEnvironment(Environment[LifeDriftAction, LifeDriftObservation, Li
             avg_drift = sum(session["drift_history"]) / len(session["drift_history"])
             avg_energy = sum(session["energy_history"]) / len(session["energy_history"])
             max_fatigue = max(session["fatigue_history"])
-            avg_reward = (
-                sum(session["reward_history"]) / len(session["reward_history"])
-                if session["reward_history"]
-                else 0
-            )
             energy_var = sum(
                 (e - avg_energy) ** 2 for e in session["energy_history"]
             ) / len(session["energy_history"])
@@ -262,13 +262,25 @@ class LifeDriftEnvironment(Environment[LifeDriftAction, LifeDriftObservation, Li
 
             drift_component = max(0, 1.0 - avg_drift)
             burnout_penalty = max(0, 1.0 - max_fatigue)
-            reward_component = max(0, min(1.0, (avg_reward + 1) / 2))
+
+            # Final-state weighting: where the agent ENDS dominates over
+            # trajectory averages, so smart endgame play is rewarded.
+            final_alignment = session["goal_alignment_score"]
+            final_drift = session["drift_score"]
+            final_fatigue = session["fatigue"]
+            final_energy = session["energy_level"]
+            final_state_quality = (
+                0.40 * final_alignment
+                + 0.30 * (1.0 - final_drift)
+                + 0.20 * (1.0 - final_fatigue)
+                + 0.10 * final_energy
+            )
 
             return round(
-                0.3 * drift_component
-                + 0.25 * stability_score
-                + 0.25 * burnout_penalty
-                + 0.2 * reward_component,
+                0.25 * drift_component
+                + 0.20 * stability_score
+                + 0.20 * burnout_penalty
+                + 0.35 * final_state_quality,
                 4,
             )
 
@@ -310,10 +322,12 @@ class LifeDriftEnvironment(Environment[LifeDriftAction, LifeDriftObservation, Li
             session["focus_score"] += random.uniform(0.03, 0.07)
 
         elif action_type == "reduce_difficulty":
+            # Trade: sustainability for ambition.
+            # Simplifying the task relieves fatigue and recovers energy,
+            # but lowering your sights drifts you from the real goal.
             session["fatigue"] -= random.uniform(0.03, 0.07)
             session["energy_level"] += random.uniform(0.02, 0.05)
-            session["goal_alignment_score"] += random.uniform(0.03, 0.08)
-            session["drift_score"] -= random.uniform(0.02, 0.05)
+            session["drift_score"] += random.uniform(0.02, 0.05)
 
         elif action_type == "prioritize_goal":
             session["goal_alignment_score"] += random.uniform(0.1, 0.2)
